@@ -115,6 +115,40 @@ func loadCertificate(filename string) (*x509.Certificate, error) {
 	return x509.ParseCertificate(block.Bytes)
 }
 
+// loadCRLFromFile loads a single CRL from PEM file
+func loadCRLFromFile(crlFile string) (*x509.RevocationList, error) {
+	data, err := os.ReadFile(crlFile)
+	if err != nil {
+		return nil, fmt.Errorf("error reading CRL file %s: %v", crlFile, err)
+	}
+
+	// Parse PEM format
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM from CRL file %s", crlFile)
+	}
+
+	if block.Type != "X509 CRL" && block.Type != "CRL" {
+		return nil, fmt.Errorf("invalid PEM type in CRL file %s: expected X509 CRL or CRL, got %s", crlFile, block.Type)
+	}
+
+	// Parse CRL
+	crl, err := x509.ParseRevocationList(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing CRL from file %s: %v", crlFile, err)
+	}
+
+	fmt.Printf("✓ Loaded CRL from: %s\n", crlFile)
+	fmt.Printf("  Issuer: %s\n", crl.Issuer.String())
+	fmt.Printf("  This Update: %s\n", crl.ThisUpdate.Format("2006-01-02 15:04:05"))
+	if !crl.NextUpdate.IsZero() {
+		fmt.Printf("  Next Update: %s\n", crl.NextUpdate.Format("2006-01-02 15:04:05"))
+	}
+	fmt.Printf("  Revoked Certificates: %d\n\n", len(crl.RevokedCertificates))
+
+	return crl, nil
+}
+
 func addPassword(inputFile, outputFile, userPassword, ownerPassword string) error {
 	conf := model.NewDefaultConfiguration()
 	conf.UserPW = userPassword
@@ -273,6 +307,7 @@ func validateSignaturesDetailed(inputFile string) error {
 	return nil
 }
 
+/*
 // validateSignatureSimple validates and shows ONLY true or false
 func validateSignatureSimple(inputFile string) error {
 	file, err := os.Open(inputFile)
@@ -302,6 +337,135 @@ func validateSignatureSimple(inputFile string) error {
 		fmt.Println("Verified: true")
 	} else {
 		fmt.Println("Verified: false")
+	}
+
+	return nil
+}
+*/
+
+// validateSignatureSimple validates and shows validity for each signer
+func validateSignatureSimple(inputFile string) error {
+	file, err := os.Open(inputFile)
+	if err != nil {
+		fmt.Println("Error opening file")
+		return nil
+	}
+	defer file.Close()
+
+	response, err := verify.VerifyFile(file)
+	if err != nil {
+		fmt.Println("Error validating signatures")
+		return nil
+	}
+
+	// Check if there are any signatures
+	if len(response.Signers) == 0 {
+		fmt.Println("No signatures found")
+		return nil
+	}
+
+	// Show validity for each signer
+	for i, signer := range response.Signers {
+		status := "INVALID"
+		if signer.ValidSignature {
+			status = "VALID"
+		}
+		
+		// Get signer name or use placeholder
+		signerName := signer.Name
+		if signerName == "" {
+			signerName = fmt.Sprintf("Signer %d", i+1)
+		}
+		
+		fmt.Printf("Signer: %s - Status: %s\n", signerName, status)
+	}
+
+	// Also show overall summary
+	validCount := 0
+	for _, signer := range response.Signers {
+		if signer.ValidSignature {
+			validCount++
+		}
+	}
+	
+	fmt.Printf("\nSummary: %d of %d signatures are valid\n", validCount, len(response.Signers))
+	
+	if validCount == len(response.Signers) {
+		fmt.Println("Overall: ALL signatures are valid")
+	} else if validCount > 0 {
+		fmt.Println("Overall: SOME signatures are valid")
+	} else {
+		fmt.Println("Overall: NO valid signatures")
+	}
+
+	return nil
+}
+
+func validateSignaturesSimpleWithCRL(inputFile string, crlFile string) error {
+	file, err := os.Open(inputFile)
+	if err != nil {
+		return fmt.Errorf("error opening file: %w", err)
+	}
+	defer file.Close()
+
+	var crl *x509.RevocationList
+	if crlFile != "" {
+		crl, err = loadCRLFromFile(crlFile)
+		if err != nil {
+			return fmt.Errorf("error loading CRL file: %w", err)
+		}
+	} else {
+		fmt.Println("No CRL file provided — skipping local revocation check.")
+	}
+
+	// Configuração de verificação de assinaturas do PDF
+	options := verify.DefaultVerifyOptions()
+	options.EnableExternalRevocationCheck = false // evita download automático
+
+	response, err := verify.VerifyFileWithOptions(file, options)
+	if err != nil {
+		return fmt.Errorf("error validating signatures: %w", err)
+	}
+
+	if len(response.Signers) == 0 {
+		fmt.Println("No signatures found")
+		return nil
+	}
+
+	fmt.Println("CRL Check Results:")
+	fmt.Println("==================")
+
+	revokedCount := 0
+	for i, signer := range response.Signers {
+		signerName := signer.Name
+		if signerName == "" {
+			signerName = fmt.Sprintf("Signer_%d", i+1)
+		}
+
+		status := "NOT REVOKED"
+
+		// Verificação manual de CRL local
+		if crl != nil && len(signer.Certificates) > 0 {
+			// Pega o primeiro certificado da assinatura
+			cert := signer.Certificates[0].Certificate
+			signerSerial := cert.SerialNumber
+			for _, revoked := range crl.RevokedCertificates {
+				if revoked.SerialNumber.Cmp(signerSerial) == 0 {
+					status = "REVOKED"
+					revokedCount++
+					break
+				}
+			}
+		}
+
+		fmt.Printf("%s: %s\n", signerName, status)
+	}
+
+	fmt.Printf("\nSummary: %d of %d signatures are revoked\n", revokedCount, len(response.Signers))
+	if revokedCount > 0 {
+		fmt.Println("Overall: Some signers are revoked")
+	} else {
+		fmt.Println("Overall: No revoked signers found")
 	}
 
 	return nil
@@ -342,11 +506,13 @@ func main() {
 	cmdValidateSig := flag.Bool("validate-sig", false, "Validate signatures")
 	cmdValidateSigDetailed := flag.Bool("validate-sig-detailed", false, "Validate signatures in detail")
 	cmdValidateSigSimple := flag.Bool("validate-sig-simple", false, "Validate signatures (true/false)")
+	cmdValidateSigSimpleWithCRL := flag.Bool("validate-sig-simple-crl", false, "Validate signatures (true/false)")
 	cmdValidate := flag.Bool("validate", false, "Validate PDF")
 	cmdKeyInfo := flag.Bool("key-info", false, "Display key information")
 
 	// Parameter flags
 	input := flag.String("input", "", "Input PDF file")
+	crl := flag.String("crl", "", "Input CRL file")
 	output := flag.String("output", "", "Output PDF file")
 	userPass := flag.String("user", "", "User password")
 	ownerPass := flag.String("owner", "", "Owner password")
@@ -410,6 +576,13 @@ func main() {
 		}
 		err = validateSignatureSimple(*input)
 
+	case *cmdValidateSigSimpleWithCRL:
+		if *input == "" {
+			fmt.Println("Error: -input is required")
+			return
+		}
+		err = validateSignaturesSimpleWithCRL(*input, *crl)
+
 	case *cmdValidate:
 		if *input == "" {
 			fmt.Println("Error: -input is required")
@@ -433,6 +606,7 @@ func main() {
 		fmt.Println("  -validate-sig                   Validate signatures")
 		fmt.Println("  -validate-sig-detailed          Validate signatures in detail")
 		fmt.Println("  -validate-sig-simple            Validate signatures (true/false)")
+		fmt.Println("  -validate-sig-simple-crl        Validate signatures against a CRL")
 		fmt.Println("  -validate                       Validate PDF")
 		fmt.Println("  -key-info                       Display key/certificate information")
 		fmt.Println("\nExamples:")
