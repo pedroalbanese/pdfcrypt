@@ -299,9 +299,9 @@ func validateSignatureSimple(inputFile string) error {
 	}
 
 	if hasValidSignature {
-		fmt.Println("true")
+		fmt.Println("Verified: true")
 	} else {
-		fmt.Println("false")
+		fmt.Println("Verified: false")
 	}
 
 	return nil
